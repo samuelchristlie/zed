@@ -1,7 +1,7 @@
 use anyhow::Result;
-use futures::{FutureExt, StreamExt, future::{self, BoxFuture}};
+use futures::{FutureExt, StreamExt, AsyncReadExt, future::{self, BoxFuture}};
 use gpui::{AnyView, App, AsyncApp, Context, Entity, FocusHandle, Focusable, SharedString, Task, Window};
-use http_client::HttpClient;
+use http_client::{HttpClient, Method, AsyncBody, Request as HttpRequest};
 use language_model::{
     AuthenticateError, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
@@ -9,7 +9,6 @@ use language_model::{
     LanguageModelToolChoice, MessageContent, RateLimiter, StopReason, TokenUsage,
     LanguageModelToolUseId, LanguageModelToolUse,
 };
-use open_ai::{ResponseStreamEvent, stream_completion};
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
 use std::pin::Pin;
@@ -23,7 +22,184 @@ use util::ResultExt;
 use zed_env_vars::{EnvVar, env_var};
 
 use crate::api_key::ApiKeyState;
-use crate::provider::open_ai::into_open_ai;
+
+// Z.AI API Structures
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatThinking {
+    pub r#type: ChatThinkingType,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatThinkingType {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ZAiRequest {
+    pub model: String,
+    pub messages: Vec<ZAiMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ChatThinking>,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ZAiTool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ZAiToolChoice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+}
+
+fn default_temperature() -> f32 {
+    1.0
+}
+
+#[derive(Debug, Serialize)]
+pub struct ZAiMessage {
+    pub role: ZAiRole,
+    pub content: ZAiContent,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ZAiRole {
+    User,
+    Assistant,
+    System,
+    Tool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum ZAiContent {
+    Text(String),
+    ToolCalls(Vec<ZAiToolCall>),
+    ToolResult(String),
+}
+
+#[derive(Debug, Serialize)]
+pub struct ZAiTool {
+    pub r#type: String,
+    pub function: ZAiFunction,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ZAiFunction {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZAiToolChoice {
+    Auto,
+    None,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ZAiToolCall {
+    pub id: String,
+    pub r#type: String,
+    pub function: ZAiFunctionCall,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ZAiFunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+pub fn into_z_ai(
+    request: LanguageModelRequest,
+    model_id: &str,
+    thinking_enabled: bool,
+) -> ZAiRequest {
+    let mut messages = Vec::new();
+
+    for message in request.messages {
+        if message.contents_empty() {
+            continue;
+        }
+
+        let role = match message.role {
+            language_model::Role::User => ZAiRole::User,
+            language_model::Role::Assistant => ZAiRole::Assistant,
+            language_model::Role::System => ZAiRole::System,
+        };
+
+        let mut message_parts = Vec::new();
+        for content_item in message.content {
+            match content_item {
+                MessageContent::Text(text) => {
+                    if !text.is_empty() {
+                        message_parts.push(text);
+                    }
+                }
+                MessageContent::Thinking { text, .. } => {
+                    if !text.is_empty() {
+                        message_parts.push(text);
+                    }
+                }
+                MessageContent::RedactedThinking(_) => {
+                }
+                MessageContent::Image(_) => {
+                }
+                MessageContent::ToolUse(_) => {
+                }
+                MessageContent::ToolResult(_) => {
+                }
+            }
+        }
+
+        let content = message_parts.join(" ");
+        if !content.is_empty() {
+            messages.push(ZAiMessage {
+                role,
+                content: ZAiContent::Text(content),
+            });
+        }
+    }
+
+    let tools: Vec<ZAiTool> = request.tools.into_iter().map(|tool| ZAiTool {
+        r#type: "function".to_string(),
+        function: ZAiFunction {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.input_schema,
+        },
+    }).collect();
+
+    let tool_choice = request.tool_choice.map(|choice| match choice {
+        LanguageModelToolChoice::Auto => ZAiToolChoice::Auto,
+        LanguageModelToolChoice::None => ZAiToolChoice::None,
+        _ => ZAiToolChoice::Auto,
+    });
+
+    ZAiRequest {
+        model: model_id.to_string(),
+        messages,
+        thinking: if thinking_enabled {
+            Some(ChatThinking {
+                r#type: ChatThinkingType::Enabled,
+            })
+        } else {
+            None
+        },
+        temperature: request.temperature.unwrap_or(1.0),
+        max_tokens: None,
+        stream: false,
+        tools,
+        tool_choice,
+        stop: request.stop,
+    }
+}
 
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("z_ai");
 const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new("Z.AI");
@@ -317,35 +493,62 @@ impl LanguageModel for ZAiLanguageModel {
         };
 
         let future = request_limiter.stream(async move {
-            // Handle thinking mode - Z.AI models support thinking configuration
             let thinking_enabled = request.thinking_allowed && model.supports_thinking();
-
-            let openai_request = into_open_ai(
-                request,
-                model.id(),
-                false, // supports_parallel_tool_calls
-                false, // supports_prompt_cache_key
-                model.max_output_tokens().map(|t| t as u64),
-                if thinking_enabled { Some(open_ai::ReasoningEffort::Medium) } else { None },
-            );
+            let z_ai_request = into_z_ai(request, model.id(), thinking_enabled);
 
             let api_url = api_url.trim_end_matches('/');
-            let completions = stream_completion(
-                &*http_client,
-                api_url,
-                &api_key,
-                openai_request,
-            )
-            .await
-            .map_err(|error| LanguageModelCompletionError::from_cloud_failure(
-                PROVIDER_NAME,
-                "stream_error".to_string(),
-                error.to_string(),
-                None,
-            ))?;
+
+            let request_body = serde_json::to_string(&z_ai_request)
+                .map_err(|error| LanguageModelCompletionError::from_cloud_failure(
+                    PROVIDER_NAME,
+                    "serialization_error".to_string(),
+                    format!("Failed to serialize request: {}", error),
+                    None,
+                ))?;
+
+            let http_request = HttpRequest::builder()
+                .method(Method::POST)
+                .uri(format!("{}/chat/completions", api_url))
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json")
+                .header("Accept-Language", "en-US,en")
+                .body(AsyncBody::from(request_body))
+                .map_err(|error| LanguageModelCompletionError::from_cloud_failure(
+                    PROVIDER_NAME,
+                    "http_request_error".to_string(),
+                    format!("Failed to build HTTP request: {}", error),
+                    None,
+                ))?;
+
+            let mut response = http_client.send(http_request)
+                .await
+                .map_err(|error| LanguageModelCompletionError::from_cloud_failure(
+                    PROVIDER_NAME,
+                    "http_error".to_string(),
+                    error.to_string(),
+                    None,
+                ))?;
+
+            if !response.status().is_success() {
+                return Err(LanguageModelCompletionError::from_cloud_failure(
+                    PROVIDER_NAME,
+                    "api_error".to_string(),
+                    format!("API returned status: {}", response.status()),
+                    None,
+                ));
+            }
+
+            let mut body = String::new();
+            response.body_mut().read_to_string(&mut body).await
+                .map_err(|error| LanguageModelCompletionError::from_cloud_failure(
+                    PROVIDER_NAME,
+                    "response_read_error".to_string(),
+                    format!("Failed to read response body: {}", error),
+                    None,
+                ))?;
 
             let mapper = ZAiEventMapper::new();
-            Ok(mapper.map_stream(completions.boxed()).boxed())
+            Ok(mapper.map_response(body).boxed())
         });
 
         async move { Ok(future.await?.boxed()) }.boxed()
@@ -353,6 +556,52 @@ impl LanguageModel for ZAiLanguageModel {
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+// Z.AI Response Structures
+#[derive(Debug, Deserialize)]
+pub struct ZAiResponse {
+    pub id: String,
+    pub request_id: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ZAiChoice>,
+    pub usage: Option<ZAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ZAiChoice {
+    pub index: usize,
+    pub message: ZAiMessageResponse,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ZAiMessageResponse {
+    pub role: String,
+    pub content: String,
+    pub reasoning_content: Option<String>,
+    pub tool_calls: Option<Vec<ZAiToolCallResponse>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ZAiToolCallResponse {
+    pub id: String,
+    pub r#type: String,
+    pub function: ZAiFunctionResponse,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ZAiFunctionResponse {
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ZAiUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, EnumIter)]
 pub enum ZAiModel {
     #[default]
@@ -450,30 +699,102 @@ impl ZAiEventMapper {
         }
     }
 
+    // This method is no longer used - we use map_response instead
+    #[allow(dead_code)]
     pub fn map_stream(
-        mut self,
-        events: Pin<Box<dyn Send + futures::Stream<Item = Result<ResponseStreamEvent>>>>,
+        self,
+        _events: Pin<Box<dyn Send + futures::Stream<Item = Result<()>>>>,
     ) -> impl futures::Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>
     {
-        events.flat_map(move |event| {
-            futures::stream::iter(match event {
-                Ok(event) => self.map_event(event),
-                Err(error) => vec![Err(LanguageModelCompletionError::from_cloud_failure(
-                    PROVIDER_NAME,
-                    "stream_error".to_string(),
-                    error.to_string(),
-                    None,
-                ))],
-            })
-        })
+        // Return an empty stream since this method is deprecated
+        futures::stream::empty()
     }
 
+    // This method is deprecated - we use process_response instead
+    #[allow(dead_code)]
     pub fn map_event(
         &mut self,
-        event: ResponseStreamEvent,
+        _event: (),
+    ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
+        // This method is deprecated - we use process_response instead
+        vec![]
+    }
+
+    fn process_response(
+        &self,
+        response_body: String,
     ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
         let mut events = Vec::new();
-        if let Some(usage) = event.usage {
+
+        // Parse the Z.AI response
+        let response: ZAiResponse = match serde_json::from_str(&response_body) {
+            Ok(response) => response,
+            Err(error) => {
+                events.push(Err(LanguageModelCompletionError::from_cloud_failure(
+                    PROVIDER_NAME,
+                    "parse_error".to_string(),
+                    format!("Failed to parse Z.AI response: {}", error),
+                    None,
+                )));
+                return events;
+            }
+        };
+
+        // Process each choice
+        for choice in &response.choices {
+            // Handle thinking content if present (Z.AI returns reasoning_content separate from main content)
+            if let Some(reasoning_content) = &choice.message.reasoning_content {
+                if !reasoning_content.is_empty() {
+                    events.push(Ok(LanguageModelCompletionEvent::Thinking {
+                        text: reasoning_content.clone(),
+                        signature: None,
+                    }));
+                }
+            }
+
+            // Handle main content
+            if !choice.message.content.is_empty() {
+                events.push(Ok(LanguageModelCompletionEvent::Text(choice.message.content.clone())));
+            }
+
+            // Handle tool calls
+            if let Some(tool_calls) = &choice.message.tool_calls {
+                for tool_call in tool_calls {
+                    let tool_use_id = LanguageModelToolUseId::from(tool_call.id.as_str());
+                    let arguments = if tool_call.function.arguments.is_string() {
+                        tool_call.function.arguments.as_str().unwrap_or("").to_string()
+                    } else {
+                        tool_call.function.arguments.to_string()
+                    };
+
+                    events.push(Ok(LanguageModelCompletionEvent::ToolUse(
+                        LanguageModelToolUse {
+                            id: tool_use_id.clone(),
+                            name: tool_call.function.name.clone().into(),
+                            raw_input: arguments.clone(),
+                            input: serde_json::Value::String(arguments),
+                            is_input_complete: true,
+                        }
+                    )));
+                }
+            }
+        }
+
+        // Send completion event
+        if let Some(choice) = response.choices.first() {
+            let stop_reason = match choice.finish_reason.as_deref() {
+                Some("stop") => StopReason::EndTurn,
+                Some("tool_calls") => StopReason::ToolUse,
+                Some("length") => StopReason::MaxTokens,
+                Some("sensitive") => StopReason::EndTurn, // Map sensitive content to end turn
+                _ => StopReason::EndTurn,
+            };
+
+            events.push(Ok(LanguageModelCompletionEvent::Stop(stop_reason)));
+        }
+
+        // Send usage information if available
+        if let Some(usage) = response.usage {
             events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
@@ -482,73 +803,15 @@ impl ZAiEventMapper {
             })));
         }
 
-        let Some(choice) = event.choices.first() else {
-            return events;
-        };
-
-        if let Some(content) = choice.delta.content.clone() {
-            if !content.is_empty() {
-                events.push(Ok(LanguageModelCompletionEvent::Text(content)));
-            }
-        }
-
-        if let Some(tool_calls) = choice.delta.tool_calls.as_ref() {
-            for tool_call in tool_calls {
-                let entry = self.tool_calls_by_index.entry(tool_call.index).or_default();
-
-                if let Some(tool_id) = tool_call.id.clone() {
-                    entry.id = tool_id;
-                }
-
-                if let Some(function) = tool_call.function.as_ref() {
-                    if let Some(name) = function.name.clone() {
-                        entry.name = name;
-                    }
-
-                    if let Some(arguments) = function.arguments.clone() {
-                        entry.arguments.push_str(&arguments);
-                    }
-                }
-            }
-        }
-
-        match choice.finish_reason.as_deref() {
-            Some("stop") => {
-                events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
-            }
-            Some("tool_calls") => {
-                events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {
-                    match serde_json::from_str::<serde_json::Value>(&tool_call.arguments) {
-                        Ok(input) => Ok(LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
-                            id: LanguageModelToolUseId::from(tool_call.id),
-                            name: tool_call.name.into(),
-                            raw_input: tool_call.arguments.clone(),
-                            input,
-                            is_input_complete: true,
-                        })),
-                        Err(error) => Err(LanguageModelCompletionError::from_cloud_failure(
-                            PROVIDER_NAME,
-                            "parse_error".to_string(),
-                            format!("failed to parse tool use arguments: {error}"),
-                            None,
-                        )),
-                    }
-                }));
-            }
-            Some("length") => {
-                events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
-            }
-            Some("content_filter") => {
-                events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
-            }
-            Some(reason) => {
-                log::warn!("unknown finish reason: {reason}");
-                events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
-            }
-            None => {}
-        }
-
         events
+    }
+
+    pub fn map_response(
+        self,
+        response_body: String,
+    ) -> Pin<Box<dyn Send + futures::Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>>> {
+        // Use a simple implementation without async_stream
+        Box::pin(futures::stream::iter(self.process_response(response_body)))
     }
 }
 
