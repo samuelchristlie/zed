@@ -1881,6 +1881,9 @@
     "x_ai": {
       "api_url": "https://api.x.ai/v1"
     },
+    "z_ai": {
+      "api_url": "https://api.z.ai/api/coding/paas/v4"
+    },
     "zed.dev": {}
   },
   "session": {

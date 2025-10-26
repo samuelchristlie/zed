@@ -21,6 +21,7 @@ pub struct AllLanguageModelSettingsContent {
     pub openai_compatible: Option<HashMap<Arc<str>, OpenAiCompatibleSettingsContent>>,
     pub vercel: Option<VercelSettingsContent>,
     pub x_ai: Option<XAiSettingsContent>,
+    pub z_ai: Option<ZAiSettingsContent>,
     #[serde(rename = "zed.dev")]
     pub zed_dot_dev: Option<ZedDotDevSettingsContent>,
 }
@@ -310,6 +311,25 @@ pub struct XaiAvailableModel {
 
 #[skip_serializing_none]
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
+pub struct ZAiSettingsContent {
+    #[serde(default = "default_empty_string")]
+    pub api_url: Option<String>,
+    pub available_models: Option<Vec<ZAiAvailableModel>>,
+}
+
+#[skip_serializing_none]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZAiAvailableModel {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub max_tokens: u64,
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub supports_thinking: bool,
+}
+
+#[skip_serializing_none]
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
 pub struct ZedDotDevSettingsContent {
     pub available_models: Option<Vec<ZedDotDevAvailableModel>>,
 }
@@ -425,4 +445,8 @@ pub enum ModelMode {
         /// The maximum number of tokens to use for reasoning. Must be lower than the model's `max_output_tokens`.
         budget_tokens: Option<u32>,
     },
+}
+
+fn default_empty_string() -> Option<String> {
+    Some(String::new())
 }
