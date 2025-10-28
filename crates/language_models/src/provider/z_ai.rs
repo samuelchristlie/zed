@@ -36,6 +36,52 @@ pub enum ChatThinkingType {
     Disabled,
 }
 
+// Streaming response structures
+#[derive(Debug, Deserialize)]
+pub struct ZAiStreamResponse {
+    pub id: String,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ZAiStreamChoice>,
+    pub usage: Option<ZAiUsage>,
+    #[serde(rename = "object")]
+    pub object_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ZAiStreamChoice {
+    pub index: usize,
+    pub delta: ZAiDelta,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ZAiDelta {
+    pub role: Option<String>,
+    pub content: Option<String>,
+    #[serde(rename = "reasoning_content")]
+    pub reasoning_content: Option<String>,
+    #[serde(rename = "tool_calls")]
+    pub tool_calls: Option<Vec<ZAiToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ZAiToolCallDelta {
+    pub index: usize,
+    pub id: Option<String>,
+    pub function: Option<ZAiFunctionCallDelta>,
+    #[serde(rename = "type")]
+    pub call_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ZAiFunctionCallDelta {
+    pub name: Option<String>,
+    pub arguments: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ZAiRequest {
     pub model: String,
@@ -194,12 +240,16 @@ pub fn into_z_ai(
         },
         temperature: request.temperature.unwrap_or(1.0),
         max_tokens: None,
-        stream: false,
+        stream: true,
         tools,
         tool_choice,
         stop: request.stop,
     }
 }
+
+
+
+
 
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("z_ai");
 const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new("Z.AI");
@@ -285,6 +335,16 @@ impl ZAiLanguageModelProvider {
         })
     }
 
+    fn create_thinking_model(&self, model: ZAiModel) -> Arc<dyn LanguageModel> {
+        Arc::new(ZAiLanguageModel {
+            id: LanguageModelId::from(format!("{}-thinking", model.id())),
+            model,
+            state: self.state.clone(),
+            http_client: self.http_client.clone(),
+            request_limiter: RateLimiter::new(4),
+        })
+    }
+
     fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
         let settings = ZAiLanguageModelProvider::settings(cx);
         let mut models = Vec::new();
@@ -294,7 +354,13 @@ impl ZAiLanguageModelProvider {
             for model in ZAiModel::iter() {
                 // Skip the Custom variant for default models
                 if !matches!(model, ZAiModel::Custom { .. }) {
-                    models.push(self.create_language_model(model));
+                    models.push(self.create_language_model(model.clone()));
+                    
+                    // Add thinking variant for models that support it
+                    if model.supports_thinking() {
+                        let thinking_model = self.create_thinking_model(model);
+                        models.push(thinking_model);
+                    }
                 }
             }
         } else {
@@ -307,7 +373,13 @@ impl ZAiLanguageModelProvider {
                     max_output_tokens: available_model.max_output_tokens,
                     supports_thinking: available_model.supports_thinking,
                 };
-                models.push(self.create_language_model(model));
+                models.push(self.create_language_model(model.clone()));
+                
+                // Add thinking variant for models that support it
+                if model.supports_thinking() {
+                    let thinking_model = self.create_thinking_model(model);
+                    models.push(thinking_model);
+                }
             }
         }
 
@@ -398,7 +470,11 @@ impl LanguageModel for ZAiLanguageModel {
     }
 
     fn name(&self) -> LanguageModelName {
-        LanguageModelName::from(self.model.display_name().to_string())
+        if self.id.0.as_ref().ends_with("-thinking") {
+            LanguageModelName::from(format!("{} Thinking", self.model.display_name()))
+        } else {
+            LanguageModelName::from(self.model.display_name().to_string())
+        }
     }
 
     fn provider_id(&self) -> LanguageModelProviderId {
@@ -472,6 +548,7 @@ impl LanguageModel for ZAiLanguageModel {
     > {
         let http_client = self.http_client.clone();
         let model = self.model.clone();
+        let model_id = self.id.clone(); // Capture the LanguageModelId
         let request_limiter = self.request_limiter.clone();
         
         // Get the API key and URL before entering the rate-limited async block
@@ -493,8 +570,19 @@ impl LanguageModel for ZAiLanguageModel {
         };
 
         let future = request_limiter.stream(async move {
-            let thinking_enabled = request.thinking_allowed && model.supports_thinking();
-            let z_ai_request = into_z_ai(request, model.id(), thinking_enabled);
+            // Determine if this is a thinking model variant (ends with "-thinking")
+            let model_id_str = model_id.0.as_ref();
+            let is_thinking_model = model_id_str.ends_with("-thinking");
+            let thinking_enabled = request.thinking_allowed && (is_thinking_model || model.supports_thinking());
+            let actual_model_id = if is_thinking_model {
+                // Use the base model ID without the "-thinking" suffix
+                model_id_str.strip_suffix("-thinking").unwrap_or(model_id_str)
+            } else {
+                model_id_str
+            };
+            
+            // For now, use the regular request (non-streaming) since streaming is complex to implement
+            let z_ai_request = into_z_ai(request, actual_model_id, thinking_enabled);
 
             let api_url = api_url.trim_end_matches('/');
 
@@ -511,6 +599,7 @@ impl LanguageModel for ZAiLanguageModel {
                 .uri(format!("{}/chat/completions", api_url))
                 .header("Authorization", format!("Bearer {}", api_key))
                 .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
                 .header("Accept-Language", "en-US,en")
                 .body(AsyncBody::from(request_body))
                 .map_err(|error| LanguageModelCompletionError::from_cloud_failure(
@@ -530,25 +619,93 @@ impl LanguageModel for ZAiLanguageModel {
                 ))?;
 
             if !response.status().is_success() {
-                return Err(LanguageModelCompletionError::from_cloud_failure(
-                    PROVIDER_NAME,
-                    "api_error".to_string(),
-                    format!("API returned status: {}", response.status()),
-                    None,
-                ));
+                let mut body = String::new();
+                AsyncReadExt::read_to_string(response.body_mut(), &mut body).await.map_err(|e| {
+                    LanguageModelCompletionError::from_cloud_failure(
+                        PROVIDER_NAME,
+                        "response_read_error".to_string(),
+                        format!("Failed to read error response: {}", e),
+                        None,
+                    )
+                })?;
+
+                #[derive(Deserialize)]
+                struct ZAiErrorResponse {
+                    error: ZAiError,
+                }
+
+                #[derive(Deserialize)]
+                struct ZAiError {
+                    message: String,
+                }
+
+                return match serde_json::from_str::<ZAiErrorResponse>(&body) {
+                    Ok(error_response) => Err(LanguageModelCompletionError::from_cloud_failure(
+                        PROVIDER_NAME,
+                        "api_error".to_string(),
+                        error_response.error.message,
+                        None,
+                    )),
+                    _ => Err(LanguageModelCompletionError::from_cloud_failure(
+                        PROVIDER_NAME,
+                        "api_error".to_string(),
+                        format!("API returned status {}: {}", response.status(), body),
+                        None,
+                    )),
+                };
             }
 
-            let mut body = String::new();
-            response.body_mut().read_to_string(&mut body).await
-                .map_err(|error| LanguageModelCompletionError::from_cloud_failure(
-                    PROVIDER_NAME,
-                    "response_read_error".to_string(),
-                    format!("Failed to read response body: {}", error),
-                    None,
-                ))?;
+            // Handle streaming response using BufReader like OpenAI provider
+            use futures::{io::BufReader, AsyncBufReadExt, StreamExt};
 
+            let reader = BufReader::new(response.into_body());
             let mapper = ZAiEventMapper::new();
-            Ok(mapper.map_response(body).boxed())
+
+            let stream = reader
+                .lines()
+                .filter_map(|line| async move {
+                    match line {
+                        Ok(line) => {
+                            let line = line.trim();
+                            log::debug!("Z.AI received line: {}", line);
+
+                            // Handle SSE format - strip "data: " prefix
+                            if let Some(data_line) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) {
+                                let data_line = data_line.trim();
+
+                                if data_line == "[DONE]" {
+                                    log::debug!("Z.AI received [DONE] signal");
+                                    Some(Ok(data_line.to_string()))
+                                } else if data_line.is_empty() {
+                                    None // Skip empty data lines
+                                } else {
+                                    log::debug!("Z.AI processing data: {}", data_line);
+                                    Some(Ok(data_line.to_string()))
+                                }
+                            } else if line.is_empty() {
+                                None // Skip empty lines (SSE separators)
+                            } else if line.starts_with("event:") || line.starts_with("id:") || line.starts_with("retry:") {
+                                None // Skip SSE control lines
+                            } else {
+                                // Handle non-SSE line - might be a regular JSON response
+                                log::debug!("Z.AI processing non-SSE line: {}", line);
+                                Some(Ok(line.to_string()))
+                            }
+                        }
+                        Err(error) => {
+                            log::error!("Z.AI stream error: {}", error);
+                            Some(Err(LanguageModelCompletionError::from_cloud_failure(
+                                PROVIDER_NAME,
+                                "stream_read_error".to_string(),
+                                format!("Failed to read stream line: {}", error),
+                                None,
+                            )))
+                        }
+                    }
+                })
+                .boxed();
+
+            Ok(mapper.map_stream(Box::pin(stream)).boxed())
         });
 
         async move { Ok(future.await?.boxed()) }.boxed()
@@ -699,16 +856,7 @@ impl ZAiEventMapper {
         }
     }
 
-    // This method is no longer used - we use map_response instead
-    #[allow(dead_code)]
-    pub fn map_stream(
-        self,
-        _events: Pin<Box<dyn Send + futures::Stream<Item = Result<()>>>>,
-    ) -> impl futures::Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>
-    {
-        // Return an empty stream since this method is deprecated
-        futures::stream::empty()
-    }
+
 
     // This method is deprecated - we use process_response instead
     #[allow(dead_code)]
@@ -812,6 +960,148 @@ impl ZAiEventMapper {
     ) -> Pin<Box<dyn Send + futures::Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>>> {
         // Use a simple implementation without async_stream
         Box::pin(futures::stream::iter(self.process_response(response_body)))
+    }
+
+    pub fn map_stream(
+        mut self,
+        events: Pin<Box<dyn Send + futures::Stream<Item = Result<String, LanguageModelCompletionError>>>>,
+    ) -> impl futures::Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
+        events.flat_map(move |event| {
+            futures::stream::iter(match event {
+                Ok(event_str) => {
+                    let event_str = event_str.trim();
+                    log::debug!("Z.AI mapper processing event: {}", event_str);
+
+                    // Handle streaming response - data prefix already stripped by stream reader
+                    if event_str == "[DONE]" {
+                        vec![Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn))]
+                    } else if event_str.is_empty() {
+                        // Skip empty events
+                        Vec::new()
+                    } else {
+                        // Try to parse as Z.AI stream response
+                        match serde_json::from_str::<ZAiStreamResponse>(event_str) {
+                            Ok(stream_response) => {
+                                log::debug!("Z.AI parsed stream response successfully");
+                                self.process_stream_response(stream_response)
+                            },
+                            Err(error) => {
+                                log::error!("Z.AI failed to parse stream response '{}': {}", event_str, error);
+                                // Try parsing as regular Z.AI response (fallback for non-streaming API responses)
+                                match serde_json::from_str::<ZAiResponse>(event_str) {
+                                    Ok(_) => {
+                                        log::debug!("Z.AI parsed as regular response successfully");
+                                        self.process_response(event_str.to_string())
+                                    },
+                                    Err(_) => {
+                                        log::warn!("Z.AI couldn't parse response as either stream or regular format: {}", event_str);
+                                        Vec::new()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => vec![Err(error)],
+            })
+        })
+    }
+
+    fn process_stream_response(
+        &mut self,
+        response: ZAiStreamResponse,
+    ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
+        let mut events = Vec::new();
+
+        // Process each choice in the streaming response
+        for choice in &response.choices {
+            // Handle reasoning content (thinking)
+            if let Some(reasoning_content) = &choice.delta.reasoning_content {
+                if !reasoning_content.is_empty() {
+                    events.push(Ok(LanguageModelCompletionEvent::Thinking {
+                        text: reasoning_content.clone(),
+                        signature: None,
+                    }));
+                }
+            }
+
+            // Handle content
+            if let Some(content) = &choice.delta.content {
+                if !content.is_empty() {
+                    events.push(Ok(LanguageModelCompletionEvent::Text(content.clone())));
+                }
+            }
+
+            // Handle tool calls
+            if let Some(tool_calls) = &choice.delta.tool_calls {
+                for tool_call in tool_calls {
+                    // Track tool call by index
+                    let entry = self.tool_calls_by_index.entry(tool_call.index).or_default();
+                    
+                    if let Some(tool_id) = &tool_call.id {
+                        entry.id = tool_id.clone();
+                    }
+
+                    if let Some(function) = &tool_call.function {
+                        if let Some(name) = &function.name {
+                            entry.name = name.clone();
+                        }
+
+                        if let Some(arguments) = &function.arguments {
+                            entry.arguments.push_str(arguments);
+                        }
+                    }
+                }
+            }
+
+            // Handle finish reason
+            if let Some(finish_reason) = &choice.finish_reason {
+                let stop_reason = match finish_reason.as_str() {
+                    "stop" => StopReason::EndTurn,
+                    "tool_calls" => StopReason::ToolUse,
+                    "length" => StopReason::MaxTokens,
+                    "sensitive" => StopReason::EndTurn,
+                    _ => StopReason::EndTurn,
+                };
+                events.push(Ok(LanguageModelCompletionEvent::Stop(stop_reason)));
+            }
+        }
+
+        // Process completed tool calls when finish_reason is present
+        if response.choices.iter().any(|choice| choice.finish_reason.is_some()) {
+            for (_, tool_call) in self.tool_calls_by_index.drain() {
+                let arguments = if tool_call.arguments.is_empty() {
+                    serde_json::Value::Object(serde_json::Map::default())
+                } else {
+                    match serde_json::from_str(&tool_call.arguments) {
+                        Ok(value) => value,
+                        Err(_) => serde_json::Value::String(tool_call.arguments.clone()),
+                    }
+                };
+
+                events.push(Ok(LanguageModelCompletionEvent::ToolUse(
+                    LanguageModelToolUse {
+                        id: tool_call.id.clone().into(),
+                        name: tool_call.name.clone().into(),
+                        raw_input: tool_call.arguments.clone(),
+                        input: arguments,
+                        is_input_complete: true,
+                    }
+                )));
+            }
+        }
+
+        // Handle usage information
+        if let Some(usage) = response.usage {
+            events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            })));
+        }
+
+        events
     }
 }
 
